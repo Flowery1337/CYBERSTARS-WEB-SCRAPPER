@@ -1,61 +1,82 @@
-import cv2
-import numpy as np
+import time
+import sqlite3
+from datetime import datetime, timedelta
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import requests
+import re
 
-# stereo images setup
-left_img = cv2.imread('left_image.png', cv2.IMREAD_GRAYSCALE)
-right_img = cv2.imread('right_image.png', cv2.IMREAD_GRAYSCALE)
+conn = sqlite3.connect('parking_prices.db')
+cursor = conn.cursor()
 
-# setup of StereoSGBM
-window_size = 5
-min_disp = 16
-num_disp = 112 - min_disp
-stereo = cv2.StereoSGBM_create(
-    minDisparity=min_disp,
-    numDisparities=num_disp,
-    blockSize=window_size,
-    P1=8 * 3 * window_size ** 2,
-    P2=32 * 3 * window_size ** 2,
-    disp12MaxDiff=1,
-    uniquenessRatio=10,
-    speckleWindowSize=100,
-    speckleRange=32
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS parking_prices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    city TEXT,
+    parking_name TEXT,
+    price REAL,
+    rating TEXT,
+    reviews TEXT,
+    reservation_duration TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 )
+''')
 
-# counting disparity
-disparity_map = stereo.compute(left_img, right_img).astype(np.float32) / 16.0
+def store_data(city, parking_name, price, rating, reviews, reservation_duration):
+    cursor.execute('''INSERT INTO parking_prices (city, parking_name, price, rating, reviews, reservation_duration)
+                      VALUES (?, ?, ?, ?, ?, ?)''', (city, parking_name, price, rating, reviews, reservation_duration))
+    conn.commit()
 
-#filtration for depth
-disparity_map = cv2.medianBlur(disparity_map, 5)
+def scrape_telpark(city):
+    url = f"https://reserva.telpark.com/es/search?city={city}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        parkings = soup.find_all('div', class_='parking-info')
+        for parking in parkings:
+            name = parking.find('h3', class_='parking-name').text.strip()
+            price_match = re.search(r'\d+\.\d+', parking.text)
+            price = float(price_match.group()) if price_match else None
+            rating = parking.find('span', class_='rating').text.strip() if parking.find('span', class_='rating') else 'N/A'
+            reviews = parking.find('span', class_='reviews').text.strip() if parking.find('span', class_='reviews') else 'N/A'
+            store_data(city, name, price, rating, reviews, '24-hour')
+    else:
+        print(f"Failed to retrieve data from Telpark for city {city}. Status code: {response.status_code}")
 
-# converting
-h, w = left_img.shape[:2]
-focal_length = 0.8 * w  # фокусное расстояние
-Q = np.float32([[1, 0, 0, -w / 2.0],
-                [0, -1, 0, h / 2.0],
-                [0, 0, 0, -focal_length],
-                [0, 0, 1, 0]])
+def scrape_parclick(city):
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--disable-gpu')
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    try:
+        url = f"https://parclick.es/search?q={city}"
+        driver.get(url)
+        time.sleep(5)
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        parkings = soup.find_all('div', class_='parking')
+        for parking in parkings:
+            name = parking.find('div', class_='parking-name').text.strip()
+            price = parking.find('div', class_='parking-price').text.strip().replace('EUR', '').strip()
+            rating = parking.find('span', class_='rating').text.strip() if parking.find('span', class_='rating') else 'N/A'
+            reviews = parking.find('span', class_='reviews').text.strip() if parking.find('span', class_='reviews') else 'N/A'
+            store_data(city, name, float(price), rating, reviews, '24-hour')
+    except Exception as e:
+        print(f"Failed to retrieve data from Parclick for city {city}. Error: {e}")
+    finally:
+        driver.quit()
 
-points_3D = cv2.reprojectImageTo3D(disparity_map, Q)
-mask_map = disparity_map > disparity_map.min()
-output_points = points_3D[mask_map]
-output_colors = cv2.cvtColor(left_img, cv2.COLOR_GRAY2BGR)[mask_map]
-
-# saving .ply 
-def write_ply(filename, verts, colors):
-    verts = verts.reshape(-1, 3)
-    colors = colors.reshape(-1, 3)
-    with open(filename, 'w') as f:
-        f.write('ply\nformat ascii 1.0\n')
-        f.write(f'element vertex {len(verts)}\n')
-        f.write('property float x\nproperty float y\nproperty float z\n')
-        f.write('property uchar red\nproperty uchar green\nproperty uchar blue\n')
-        f.write('end_header\n')
-        for i in range(len(verts)):
-            f.write(f'{verts[i][0]} {verts[i][1]} {verts[i][2]} {colors[i][0]} {colors[i][1]} {colors[i][2]}\n')
-
-write_ply('output.ply', output_points, output_colors)
-
-# disparity map showing
-cv2.imshow('Disparity Map', (disparity_map - min_disp) / num_disp)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    cities = ["Madrid", "Logro\u00f1o"]
+    for city in cities:
+        print(f"Scraping data for {city}...")
+        scrape_telpark(city)
+        scrape_parclick(city)
+    print("Data scraping completed.")
+    conn.close()
